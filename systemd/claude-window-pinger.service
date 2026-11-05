@@ -1,0 +1,17 @@
+# Desktop install: a per-user service. Installed by scripts/install-desktop.sh.
+[Unit]
+Description=Start Claude's next 5-hour window after each reset
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/claude-window-pinger run
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+# Exit 78: login, plan or billing problem. Retrying cannot help.
+RestartPreventExitStatus=78
+Nice=10
+
+[Install]
+WantedBy=default.target

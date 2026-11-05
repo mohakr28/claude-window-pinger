@@ -1,0 +1,59 @@
+# Server install: a system service sandboxed to a dedicated user.
+# Installed by scripts/install-server.sh.
+[Unit]
+Description=Start Claude's next 5-hour window after each reset
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=claude-pinger
+Group=claude-pinger
+WorkingDirectory=/var/lib/claude-pinger
+Environment=HOME=/var/lib/claude-pinger
+Environment=PATH=/var/lib/claude-pinger/.local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/local/bin/claude-window-pinger run
+Restart=always
+RestartSec=60
+# Exit 78: login, plan or billing problem. Retrying cannot help.
+RestartPreventExitStatus=78
+
+# Resources: other services on this machine come first
+Nice=10
+CPUQuota=50%
+MemoryMax=768M
+TasksMax=128
+
+# Filesystem: writes only to its own directory; /home and /root are hidden
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/claude-pinger
+PrivateTmp=true
+PrivateDevices=true
+UMask=0077
+
+# Network: internet only. Local MariaDB, Redis, etc. are blocked; DNS stub allowed.
+IPAddressAllow=127.0.0.53
+IPAddressDeny=localhost
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Privileges and kernel
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

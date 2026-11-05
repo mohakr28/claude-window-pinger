@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""Start Claude's next 5-hour usage window as soon as the current one ends.
+
+Sends one tiny message through the official Claude Code CLI, reads the exact
+reset time from the CLI's rate_limit_event, sleeps until then, and repeats.
+It never reads OAuth tokens or calls private endpoints itself.
+
+Exit code 78 means a problem a retry cannot fix (login, plan, billing). The
+service stays stopped until someone fixes it and restarts it.
+"""
+import argparse
+import fcntl
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+# The cheapest useful ping: the smallest model at the lowest effort.
+MODEL = "claude-haiku-5-5"
+EFFORT = "low"
+
+EXIT_FATAL = 78
+RESET_MARGIN = 60          # seconds to wait past the reset before pinging
+NO_INFO_RECHECK = 3600     # ping worked but the CLI reported no reset time
+STALE_RECHECK = 300        # the server still reports a reset time in the past
+TRANSIENT_MAX_BACKOFF = 900
+UNKNOWN_MAX_BACKOFF = 3600
+MAX_PINGS_PER_DAY = 12     # normal use is about 5; this only stops a runaway loop
+DAY = 86400
+NOTIFY_AFTER_FAILS = 3
+SLEEP_CHUNK = 30           # short sleeps so a suspended machine catches up on wake
+PING_TIMEOUT = 120
+
+# Every ping ends in exactly one of these outcomes:
+#   OK           the message went through
+#   BLOCKED      a usage limit was hit; wait for the reset time the reply gives
+#   FATAL        login, plan or billing problem; stop until a person fixes it
+#   MODEL_ERROR  the model is unavailable; try the plan's default model once
+#   TRANSIENT    network or server trouble; retry soon, up to every 15 minutes
+#   UNKNOWN      anything else; retry slowly, up to every hour
+OK, BLOCKED, FATAL, MODEL_ERROR, TRANSIENT, UNKNOWN = "ok", "blocked", "fatal", "model", "transient", "unknown"
+
+# Checked in this order: "you hit your limit" must not be read as a plan problem.
+LIMIT_RE = re.compile(r"hit your .*limit|limit reached|usage limit|rate.?limit|too many requests")
+MODEL_RE = re.compile(r"not_found_error|access.*model|model.*(not found|not available|not exist|invalid|access)|model_not_found")
+FATAL_RE = re.compile(
+    r"not logged in|/login|authentication|unauthorized|invalid api key|oauth|"
+    r"token.*(expired|revoked)|expired.*token|forbidden|permission_error|billing|credit balance|"
+    r"subscription|not included|does not (include|support|have access)|"
+    r"(account|organization).*(disabled|suspended|banned)|"
+    r"(country|region).*(not|unsupported)|not available in your"
+)
+TRANSIENT_RE = re.compile(
+    r"overloaded|timed? ?out|connection|network|econn|enotfound|eai_again|socket|"
+    r"temporar|unavailable|internal server|bad gateway"
+)
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "claude-window-pinger"
+STATE_FILE = STATE_DIR / "state.json"
+LOCK_FILE = STATE_DIR / "lock"
+WORK_DIR = STATE_DIR / "empty-cwd"  # no CLAUDE.md or project files get loaded
+
+log = logging.getLogger("pinger")
+
+
+# ---------------------------------------------------------------------------
+# Reading the CLI's reply
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PingResult:
+    ok: bool
+    kind: str = UNKNOWN
+    resets_at: Optional[int] = None
+    blocked_until: Optional[int] = None
+    utilization: Optional[float] = None
+    using_overage: bool = False
+    api_status: Optional[int] = None
+    detail: str = ""
+
+
+def parse_stream(lines: Iterable[str]) -> PingResult:
+    """Read the CLI's stream-json output into a PingResult (kind is set by classify)."""
+    r = PingResult(ok=False)
+    code = ""
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        kind = ev.get("type")
+        if kind == "rate_limit_event":
+            info = ev.get("rate_limit_info") or {}
+            five = (info.get("unifiedWindows") or {}).get("five_hour") or {}
+            if five.get("resetsAt"):
+                r.resets_at = int(five["resetsAt"])
+                r.utilization = five.get("utilization")
+            elif info.get("rateLimitType") == "five_hour" and info.get("resetsAt"):
+                r.resets_at = int(info["resetsAt"])
+            # Rejected can mean the weekly limit, so honour its own reset time.
+            if info.get("status") == "rejected" and info.get("resetsAt"):
+                r.blocked_until = int(info["resetsAt"])
+            r.using_overage = r.using_overage or bool(info.get("isUsingOverage"))
+        elif kind == "assistant" and ev.get("error"):
+            code = str(ev["error"])
+        elif kind == "result":
+            r.ok = not ev.get("is_error", False)
+            status = ev.get("api_error_status")
+            r.api_status = status if isinstance(status, int) else None
+            if not r.ok:
+                r.detail = str(ev.get("result") or ev.get("subtype") or "error")[:300]
+    if code and not r.ok:
+        r.detail = f"{code}: {r.detail}"[:300]
+    return r
+
+
+def classify(r: PingResult, stderr: str = "") -> PingResult:
+    """Decide what a ping's outcome means for what the pinger does next."""
+    text = f"{r.detail} {stderr}".lower()
+    s = r.api_status
+    if r.using_overage:
+        r.kind, r.detail = FATAL, "CLI reports paid overage in use; stopped so nothing gets charged"
+    elif r.blocked_until:
+        r.kind = BLOCKED
+    elif r.ok:
+        r.kind = OK
+    elif s == 429 or LIMIT_RE.search(text):
+        r.kind = TRANSIENT
+    elif s == 404 or MODEL_RE.search(text):
+        r.kind = MODEL_ERROR
+    elif s in (401, 402, 403) or FATAL_RE.search(text):
+        r.kind = FATAL
+    elif (s and (s >= 500 or s == 408)) or TRANSIENT_RE.search(text):
+        r.kind = TRANSIENT
+    else:
+        r.kind = UNKNOWN
+    return r
+
+
+# ---------------------------------------------------------------------------
+# Scheduling: when to ping next
+# ---------------------------------------------------------------------------
+
+def next_wake(r: PingResult, now: float, fails: int) -> float:
+    """Return when to ping next. `fails` counts consecutive failures, this one included."""
+    if r.kind == BLOCKED and r.blocked_until and r.blocked_until > now:
+        return r.blocked_until + RESET_MARGIN
+    if r.kind == OK:
+        if r.resets_at is None:
+            return now + NO_INFO_RECHECK
+        return r.resets_at + RESET_MARGIN if r.resets_at > now else now + STALE_RECHECK
+    if r.kind == BLOCKED:  # the block had already expired when the reply came back
+        return now + STALE_RECHECK
+    cap = TRANSIENT_MAX_BACKOFF if r.kind == TRANSIENT else UNKNOWN_MAX_BACKOFF
+    return now + min(60 * 2 ** min(max(fails - 1, 0), 12), cap)
+
+
+def apply_daily_cap(wake: float, pings: List[float]) -> float:
+    """Delay `wake` if pinging then would exceed MAX_PINGS_PER_DAY successful pings."""
+    recent = sorted(t for t in pings if t > wake - DAY)
+    if len(recent) < MAX_PINGS_PER_DAY:
+        return wake
+    return max(wake, recent[-MAX_PINGS_PER_DAY] + DAY + 1)
+
+
+# ---------------------------------------------------------------------------
+# Talking to the Claude Code CLI
+# ---------------------------------------------------------------------------
+
+def find_claude() -> Optional[str]:
+    return (
+        os.environ.get("CLAUDE_BIN")
+        or shutil.which("claude")
+        or shutil.which("claude", path=str(Path.home() / ".local/bin"))
+    )
+
+
+def clean_env() -> dict:
+    """Drop CLAUDE*/ANTHROPIC* vars so the ping always uses the subscription login."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC"))}
+
+
+def preflight(claude: str) -> Optional[PingResult]:
+    """Catch login and plan problems without sending a message. None means carry on."""
+    try:
+        p = subprocess.run([claude, "auth", "status"], env=clean_env(), stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+        info = json.loads(p.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None  # an older CLI may lack this; the ping itself reports real problems
+    if not isinstance(info, dict):
+        return None
+    problem = ""
+    method = info.get("authMethod")
+    if info.get("loggedIn") is False:
+        problem = "Not logged in"
+    elif method and method != "claude.ai":
+        problem = f"Logged in with '{method}', not a claude.ai subscription; refusing so nothing gets billed"
+    elif info.get("subscriptionType") == "free":
+        problem = "The Free plan does not include Claude Code"
+    return PingResult(ok=False, kind=FATAL, detail=problem) if problem else None
+
+
+def send(claude: str, model: Optional[str]) -> PingResult:
+    # The flags below strip the session down to the smallest possible request:
+    # no tools, no MCP servers, no settings or hooks, and no saved transcript.
+    cmd = [
+        claude, "-p", "ok",
+        "--effort", EFFORT,
+        "--system-prompt", "Reply with: ok",
+        "--output-format", "stream-json", "--verbose",
+        "--no-session-persistence",
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--tools", "",
+        "--disable-slash-commands",
+    ]
+    if model:
+        cmd += ["--model", model]
+    try:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        p = subprocess.run(
+            cmd, cwd=WORK_DIR, env=clean_env(), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=PING_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return PingResult(ok=False, kind=TRANSIENT, detail=f"timed out after {PING_TIMEOUT}s")
+    except OSError as e:
+        return PingResult(ok=False, kind=UNKNOWN, detail=str(e)[:300])
+    r = parse_stream(p.stdout.splitlines())
+    if not r.ok and not r.detail:
+        r.detail = (p.stderr or p.stdout or f"exit {p.returncode}").strip()[:300]
+    return classify(r, p.stderr)
+
+
+def ping() -> PingResult:
+    claude = find_claude()
+    if not claude:
+        return PingResult(ok=False, kind=UNKNOWN, detail="claude CLI not found")
+    problem = preflight(claude)
+    if problem:
+        return problem
+    r = send(claude, MODEL)
+    if r.kind == MODEL_ERROR:
+        log.warning("model %s unavailable (%s); trying the plan's default once", MODEL, r.detail)
+        r = send(claude, None)
+        if r.kind == MODEL_ERROR:
+            r.kind = UNKNOWN
+    return r
+
+
+# ---------------------------------------------------------------------------
+# State, locking and notifications
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    try:
+        state = json.loads(STATE_FILE.read_text())
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    # A full disk must not stop the pinger: it can keep going from memory.
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=STATE_DIR)
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log.error("could not save state: %s", e)
+
+
+def acquire_lock():
+    """Return the open lock file, or None if another copy is already running."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def notify(message: str) -> None:
+    if os.environ.get("DBUS_SESSION_BUS_ADDRESS") and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "Claude Window Pinger", message],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def fmt(ts: Optional[float]) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "unknown"
+
+
+def sleep_until(ts: float) -> None:
+    # Compare against the wall clock: monotonic sleep can overshoot across suspend.
+    while (left := ts - time.time()) > 0:
+        time.sleep(min(left, SLEEP_CHUNK))
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+def run_once(fails: int) -> tuple:
+    """Ping, persist the outcome, and return (wake_time, consecutive_failures, kind)."""
+    r = ping()
+    now = time.time()
+    fails = 0 if r.kind in (OK, BLOCKED) else fails + 1
+    pings = [t for t in load_state().get("pings", []) if t > now - DAY]
+    if r.kind == OK:
+        pings.append(now)
+    if r.kind == FATAL:
+        wake = 0  # a restart after the fix should ping straight away
+    else:
+        wake = apply_daily_cap(next_wake(r, now, fails), pings)
+    save_state({"last_ping": now, "ok": r.ok, "kind": r.kind, "resets_at": r.resets_at,
+                "blocked_until": r.blocked_until, "utilization": r.utilization,
+                "next_ping": wake, "detail": r.detail, "pings": pings})
+    if r.kind == FATAL:
+        log.critical("STOPPED, a retry cannot fix this: %s", r.detail)
+        notify(f"Stopped: {r.detail[:150]}")
+    elif r.kind == BLOCKED:
+        log.warning("limit reached, next ping %s", fmt(wake))
+    elif r.kind == OK:
+        if r.resets_at is None:
+            log.warning("ping ok but the CLI reported no reset time, rechecking %s", fmt(wake))
+        else:
+            log.info("ping ok, window resets %s, next ping %s", fmt(r.resets_at), fmt(wake))
+    else:
+        log.error("ping failed [%s] (%d): %s; retry %s", r.kind, fails, r.detail, fmt(wake))
+        if fails == NOTIFY_AFTER_FAILS:
+            notify(f"Ping keeps failing: {r.detail[:150]}")
+    return wake, fails, r.kind
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+def cmd_run(_args) -> int:
+    lock = acquire_lock()
+    if lock is None:
+        log.error("another copy is already running")
+        return 1
+    wake = load_state().get("next_ping") or 0  # a restart must not cost an extra ping
+    if wake > time.time():
+        log.info("resuming, next ping %s", fmt(wake))
+    fails = 0
+    while True:
+        sleep_until(wake)
+        wake, fails, kind = run_once(fails)
+        if kind == FATAL:
+            return EXIT_FATAL
+
+
+def cmd_ping(_args) -> int:
+    lock = acquire_lock()
+    if lock is None:
+        print("The service is running, so it handles the pings. See: status", file=sys.stderr)
+        return 1
+    _, fails, kind = run_once(0)
+    if kind == FATAL:
+        return EXIT_FATAL
+    return 1 if fails else 0
+
+
+def cmd_status(_args) -> int:
+    s = load_state()
+    if not s:
+        print("No ping recorded yet.")
+        return 0
+    print(f"Last ping:     {fmt(s.get('last_ping'))} ({s.get('kind', 'unknown')})")
+    print(f"Window resets: {fmt(s.get('resets_at'))}")
+    print(f"Next ping:     {'stopped' if s.get('kind') == FATAL else fmt(s.get('next_ping'))}")
+    if s.get("utilization") is not None:
+        print(f"5h usage:      {s['utilization']:.0%}")
+    print(f"Pings in 24h:  {len(s.get('pings', []))}")
+    if s.get("detail"):
+        print(f"Last problem:  {s['detail']}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("run", help="stay running and ping after every reset").set_defaults(func=cmd_run)
+    sub.add_parser("ping", help="send one ping now").set_defaults(func=cmd_ping)
+    sub.add_parser("status", help="show the last ping and the next one").set_defaults(func=cmd_status)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Sign the service user in to Claude, then start or restart the pinger. Run as root.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "Run as root." >&2; exit 1; }
+H=/var/lib/claude-pinger
+runuser --pty -u claude-pinger -- env -i HOME="$H" PATH="$H/.local/bin:/usr/bin:/bin" TERM="${TERM:-xterm}" LANG=C.UTF-8 \
+    bash -c "cd '$H' && claude auth login --claudeai"
+systemctl restart claude-pinger.service
+sleep 15
+journalctl -u claude-pinger.service -n 5 --no-pager -o cat
